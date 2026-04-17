@@ -4,6 +4,11 @@ Categories: Added, Removed, Changed, Fixed, Nonfunctional, Deprecated
 
 ## Unreleased
 
+### Fixed
+ - Refresh expired STS sessions automatically in ``ConnectionManager``; long-running
+   deployments no longer fail with authentication errors after the STS credential
+   lifetime elapses when ``sceptre_role`` is configured.
+
 ## 4.6.0 (2025.12.09)
 - [Resolves #1568] Adding concurrency options to throttle deployments (#1560)
 - [Resolve #1562] Fix safe loads path (#1563)

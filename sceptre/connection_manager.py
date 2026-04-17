@@ -13,6 +13,7 @@ import random
 import threading
 import time
 import warnings
+from datetime import datetime, timezone
 from typing import Optional, Dict, Tuple, Any
 
 import boto3
@@ -91,6 +92,9 @@ class ConnectionManager(object):
     _session_lock = threading.Lock()
     _client_lock = threading.Lock()
     _boto_sessions = {}
+    # Maps session cache keys to their STS credential expiration datetimes.
+    # Only populated for sessions created via an assume_role call (sceptre_role).
+    _boto_session_expirations = {}
     _clients = {}
     _stack_keys = {}
 
@@ -284,6 +288,8 @@ class ConnectionManager(object):
             self.logger.debug("Getting Boto3 session")
             key = (region, profile, sceptre_role)
 
+            self._evict_session_if_expired(key)
+
             if self._boto_sessions.get(key) is None:
                 self.logger.debug("No Boto3 session found, creating one...")
                 self.logger.debug("Using cli credentials...")
@@ -337,6 +343,9 @@ class ConnectionManager(object):
                         )
 
                     self._boto_sessions[key] = session
+                    expiration = credentials.get("Expiration")
+                    if expiration is not None:
+                        self._boto_session_expirations[key] = expiration
 
                 self.logger.debug(
                     "Using credential set from %s: %s",
@@ -354,6 +363,26 @@ class ConnectionManager(object):
 
             return self._boto_sessions[key]
 
+    def _evict_session_if_expired(self, key: tuple) -> None:
+        """
+        Evicts the cached boto session and its expiration metadata for the
+        given session key if the STS temporary credentials have expired.
+
+        This must be called while holding ``_session_lock``.
+
+        :param key: The session cache key ``(region, profile, sceptre_role)``.
+        :type key: tuple
+        """
+        expiration = self._boto_session_expirations.get(key)
+        if expiration is not None and expiration <= datetime.now(timezone.utc):
+            self.logger.debug(
+                "STS credentials for session key %s have expired; evicting from "
+                "cache to force a refresh on next use.",
+                key,
+            )
+            self._boto_sessions.pop(key, None)
+            self._boto_session_expirations.pop(key, None)
+
     def _get_client(self, service, region, profile, stack_name, sceptre_role):
         """
         Returns the Boto3 client associated with <service>.
@@ -368,6 +397,19 @@ class ConnectionManager(object):
         """
         with self._client_lock:
             key = (service, region, profile, stack_name, sceptre_role)
+            session_key = (region, profile, sceptre_role)
+            # Evict the cached client when its underlying STS session has expired.
+            # We intentionally perform this check inline here rather than calling
+            # _evict_session_if_expired(), because that method modifies
+            # _boto_sessions/_boto_session_expirations and is designed to be called
+            # only while holding _session_lock.  Calling it here while holding
+            # _client_lock would modify shared session state without that lock.
+            # Instead we only discard the client entry; the subsequent call to
+            # _get_session() below will evict the expired session under _session_lock
+            # and create a fresh one.
+            expiration = self._boto_session_expirations.get(session_key)
+            if expiration is not None and expiration <= datetime.now(timezone.utc):
+                self._clients.pop(key, None)
             if self._clients.get(key) is None:
                 self.logger.debug("No %s client found, creating one...", service)
                 self._clients[key] = self._get_session(
