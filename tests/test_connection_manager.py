@@ -990,6 +990,146 @@ class TestConnectionManager(object):
         assert connection_manager.iam_role_session_duration == 123456
 
 
+    # ------------------------------------------------------------------
+    # Reactive ExpiredToken retry tests
+    #
+    # Background: The proactive eviction mechanism (checking
+    # _boto_session_expirations before returning a cached client) only covers
+    # sessions created via assume_role (sceptre_role).  For all other
+    # credential sources — e.g. env-var tokens injected by Jenkins — the
+    # expiration is never stored, so the proactive check is a no-op.
+    #
+    # The reactive retry in call() catches ExpiredToken / ExpiredTokenException
+    # ClientErrors, evicts the stale client and session, and retries the call
+    # once with a freshly-created client.  These tests exercise that path.
+    # ------------------------------------------------------------------
+
+    def test_call__expired_token_error__evicts_and_retries_successfully(self):
+        """When the first API call returns an ``ExpiredToken`` ClientError,
+        call() must evict the stale client & session then retry and return the
+        successful response from the second attempt."""
+        service = "cloudformation"
+        command = "describe_stacks"
+        self.connection_manager.region = self.region
+        self.connection_manager.profile = None
+        self.connection_manager.sceptre_role = None
+
+        stale_client = Mock(name="stale_client")
+        expired_error = ClientError(
+            {"Error": {"Code": "ExpiredToken", "Message": "Token expired"}},
+            "DescribeStacks",
+        )
+        fresh_response = {"Stacks": []}
+        stale_client.describe_stacks.side_effect = [expired_error]
+
+        fresh_client = Mock(name="fresh_client")
+        fresh_client.describe_stacks.return_value = fresh_response
+
+        client_key = (service, self.region, None, None, None)
+        self.connection_manager._clients[client_key] = stale_client
+
+        # The fresh session returns fresh_client when .client() is called
+        self.mock_session.client.return_value = fresh_client
+
+        result = self.connection_manager.call(service, command)
+
+        assert result == fresh_response
+        # The stale client must have been evicted
+        assert self.connection_manager._clients.get(client_key) is not stale_client
+
+    def test_call__expired_token_exception__evicts_and_retries_successfully(self):
+        """``ExpiredTokenException`` (returned by STS and some other services)
+        must trigger the same evict-and-retry path as ``ExpiredToken``."""
+        service = "sts"
+        command = "get_caller_identity"
+        self.connection_manager.region = self.region
+        self.connection_manager.profile = None
+        self.connection_manager.sceptre_role = None
+
+        stale_client = Mock(name="stale_client")
+        expired_error = ClientError(
+            {
+                "Error": {
+                    "Code": "ExpiredTokenException",
+                    "Message": "Token is expired",
+                }
+            },
+            "GetCallerIdentity",
+        )
+        fresh_response = {"UserId": "AIDA...", "Account": "123456789012", "Arn": "..."}
+        stale_client.get_caller_identity.side_effect = [expired_error]
+
+        fresh_client = Mock(name="fresh_client")
+        fresh_client.get_caller_identity.return_value = fresh_response
+
+        client_key = (service, self.region, None, None, None)
+        self.connection_manager._clients[client_key] = stale_client
+
+        self.mock_session.client.return_value = fresh_client
+
+        result = self.connection_manager.call(service, command)
+
+        assert result == fresh_response
+        assert self.connection_manager._clients.get(client_key) is not stale_client
+
+    def test_call__expired_token__non_sceptre_role__evicts_base_session(self):
+        """Without a sceptre_role (env-var credentials only), an ``ExpiredToken``
+        error must still evict the cached session so that the retry creates a
+        fresh session reading current environment variables."""
+        service = "cloudformation"
+        command = "describe_stacks"
+        self.connection_manager.region = self.region
+        self.connection_manager.profile = None
+        self.connection_manager.sceptre_role = None
+
+        session_key = (self.region, None, None)
+        client_key = (service, self.region, None, None, None)
+
+        stale_session = Mock(name="stale_session")
+        stale_client = Mock(name="stale_client")
+        stale_client.describe_stacks.side_effect = ClientError(
+            {"Error": {"Code": "ExpiredToken", "Message": "Token expired"}},
+            "DescribeStacks",
+        )
+        self.connection_manager._boto_sessions[session_key] = stale_session
+        self.connection_manager._clients[client_key] = stale_client
+
+        fresh_client = Mock(name="fresh_client")
+        fresh_client.describe_stacks.return_value = {"Stacks": []}
+        self.mock_session.client.return_value = fresh_client
+
+        self.connection_manager.call(service, command)
+
+        # The stale session must have been evicted
+        assert self.connection_manager._boto_sessions.get(session_key) is not stale_session
+
+    def test_call__non_expiry_client_error__not_retried(self):
+        """A ClientError that is NOT an expiry error must propagate immediately
+        without triggering the evict-and-retry path."""
+        service = "cloudformation"
+        command = "describe_stacks"
+        self.connection_manager.region = self.region
+        self.connection_manager.profile = None
+        self.connection_manager.sceptre_role = None
+
+        other_error = ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "Access denied"}},
+            "DescribeStacks",
+        )
+        client = Mock(name="client")
+        client.describe_stacks.side_effect = other_error
+
+        client_key = (service, self.region, None, None, None)
+        self.connection_manager._clients[client_key] = client
+
+        with pytest.raises(ClientError) as exc_info:
+            self.connection_manager.call(service, command)
+
+        assert exc_info.value.response["Error"]["Code"] == "AccessDenied"
+        # Called exactly once — no retry
+        client.describe_stacks.assert_called_once()
+
+
 class TestRetry:
     def test_retry_boto_call_returns_response_correctly(self):
         def func(*args, **kwargs):

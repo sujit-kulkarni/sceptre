@@ -14,7 +14,7 @@ import threading
 import time
 import warnings
 from datetime import datetime, timezone
-from typing import Optional, Dict, Tuple, Any
+from typing import Optional, Dict, Tuple, Any, FrozenSet
 
 import boto3
 import deprecation
@@ -23,6 +23,13 @@ from botocore.exceptions import ClientError
 
 from sceptre.exceptions import InvalidAWSCredentialsError, RetryLimitExceededError
 from sceptre.helpers import mask_key, create_deprecated_alias_property
+
+# AWS error codes indicating that STS credentials or environment-variable tokens
+# have expired.  We handle these with a single catch-evict-retry in call() so
+# that ALL credential sources (not just sceptre_role) are covered.
+_EXPIRED_TOKEN_ERROR_CODES: FrozenSet[str] = frozenset(
+    {"ExpiredToken", "ExpiredTokenException"}
+)
 
 
 def _retry_boto_call(func):
@@ -383,6 +390,28 @@ class ConnectionManager(object):
             self._boto_sessions.pop(key, None)
             self._boto_session_expirations.pop(key, None)
 
+    def _evict_client_and_session(
+        self, service: str, region: str, profile: str, stack_name: str, sceptre_role: str
+    ) -> None:
+        """Evict both the cached client and the underlying session for the given
+        parameters.  Called reactively when AWS returns an ExpiredToken error so
+        that the next ``_get_client`` call creates a completely fresh session and
+        client regardless of which credential source was in use.
+
+        :param service: The boto3 service name.
+        :param region: The AWS region.
+        :param profile: The AWS profile name.
+        :param stack_name: The CloudFormation stack name.
+        :param sceptre_role: The IAM role ARN (or None).
+        """
+        client_key = (service, region, profile, stack_name, sceptre_role)
+        session_key = (region, profile, sceptre_role)
+        with self._client_lock:
+            self._clients.pop(client_key, None)
+        with self._session_lock:
+            self._boto_sessions.pop(session_key, None)
+            self._boto_session_expirations.pop(session_key, None)
+
     def _get_client(self, service, region, profile, stack_name, sceptre_role):
         """
         Returns the Boto3 client associated with <service>.
@@ -506,7 +535,21 @@ class ConnectionManager(object):
             kwargs = {}
 
         client = self._get_client(service, region, profile, stack_name, sceptre_role)
-        return getattr(client, command)(**kwargs)
+        try:
+            return getattr(client, command)(**kwargs)
+        except ClientError as e:
+            if e.response["Error"]["Code"] in _EXPIRED_TOKEN_ERROR_CODES:
+                self.logger.debug(
+                    "Credentials expired (%s); evicting cached session and client "
+                    "then retrying the call once.",
+                    e.response["Error"]["Code"],
+                )
+                self._evict_client_and_session(
+                    service, region, profile, stack_name, sceptre_role
+                )
+                client = self._get_client(service, region, profile, stack_name, sceptre_role)
+                return getattr(client, command)(**kwargs)
+            raise
 
     def _coalesce_sceptre_role(self, iam_role: str, sceptre_role: str) -> str:
         """Evaluates the iam_role and sceptre_role parameters as passed to determine which value to
